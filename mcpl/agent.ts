@@ -6,6 +6,7 @@
 
 import { BodyStateReader, type BodyObservation, type PublicPose } from "./body-state.ts";
 import { mentionRegex } from "./mention.ts";
+import { mergePose } from "../shared/humanoid.js";
 import * as THREE_W from "three/webgpu";
 import * as TSL from "three/tsl";
 import { NoiseGate, SHORT_STINT_MS, APPROACH_REFRACT_MS, APPROACH_RADIUS, REARM_RADIUS,
@@ -51,7 +52,7 @@ import { describeParticles, emitterTransition, transitionLine } from "../shared/
 import { describePicture } from "../shared/picture.js";
 import { describeCaptions } from "../shared/captions.js";
 import { describeSound } from "../shared/sound.js";
-import { cellKey, describeStructure, describeHere, halfFloored, localizePoint, nodeAtPoint, planStructure, routeLocal } from "../shared/structure.js";
+import { cellKey, halfFloored, nodeAtPoint, describeStructure, describeHere, localizePoint, planStructure, planRouteLocal, routeSegmentClear } from "../shared/structure.js";
 import { effectiveWorldTransform, type Effective } from "./effective.ts";
 import { makeVerdictCache, seatGateCore, nameFromAvatarPath } from "../client/lib/seatcore.js";
 
@@ -150,6 +151,9 @@ const fillOf = (t: { area: number; x: number[]; z: number[] }) => {
 const DECK_FILL = 0.45;
 
 // A canned "knocked over" pose for headless agents, which cannot simulate.
+/** One bone of a held pose: a rotation, or {q, t, s} (shared/humanoid.js poseChannels). */
+type PoseValue = number[] | { q?: number[]; t?: number[]; s?: number[] | number };
+
 const DOWNED_POSE: Record<string, number[]> = {
   spine: [0.6, 0, 0, 0.8], chest: [0.5, 0, 0, 0.87], neck: [0.3, 0, 0, 0.95],
   leftUpperArm: [0, 0, -0.9, 0.44], rightUpperArm: [0, 0, 0.9, 0.44],
@@ -164,13 +168,17 @@ export class WorldAgent {
   pos = { x: 0, y: 0, z: 0 };
   yaw = 0; speed = 0; clip = "idle";
   private target: (Vec2 & { run: boolean; tolerance?: number }) | null = null;
-  /** Remaining waypoints of a routed walk — see walkTo. Empty means the target
-   *  is reachable in a straight line, which is every case outside a building. */
+  /** Remaining validated centerline waypoints. Only the destination uses
+   * the caller's tolerance; intermediate waypoints are reached exactly. */
   private legs: Vec2[] = [];
+  private walkTolerance = ARRIVE;
+  /** Planning is synchronous; a caller can capture this immediately after
+   * walkTo() so a later replacement walk cannot change its refusal receipt. */
+  walkRefusal: string | null = null;
   /** A held custom pose — sparse humanoid-bone quaternions. Presence only:
    *  it rides the pose packet and is never a log verb, because it is a moment,
    *  not a change to the world. `null` clears. */
-  heldPose: Record<string, number[]> | null = null;
+  heldPose: Record<string, PoseValue> | null = null;
   /** Where heldPose came from. An AUTHORED pose (set deliberately — the pose
    *  tool, a puppet, the server's settled memory) is a place: it survives
    *  walking, posture changes and sleep. A PHYSICS pose (ragdoll sim frame,
@@ -190,7 +198,7 @@ export class WorldAgent {
    *  sites, and the one that got missed would be a pose that outlived every
    *  walk forever. This cannot be missed: it is the same identity trick the
    *  renderer's `_composeBegin` and the interpolator's `lastPose` both use. */
-  private heldPoseSticky: Record<string, number[]> | null = null;
+  private heldPoseSticky: Record<string, PoseValue> | null = null;
   draggedBy: string | null = null;   // whose takeover sim drives this body (bodydrag)
   dragAt = 0;                        // last drag sample, for the silence timeout
   pins = new Map<string, number[]>(); // persistent bodydrag nails: joint -> [x,y,z]
@@ -721,8 +729,19 @@ export class WorldAgent {
                 (msg.ragdoll as { lean?: number[] })?.lean ?? null,
                 `(${msg.by} knocks you over)`);
             }
-            if (msg.pose) { this.heldPose = msg.pose; this.heldPoseAuthored = true; } // posed BY someone = authored
-            if (msg.anim) this.ws?.send(JSON.stringify({ type: "anim", ...msg.anim }));
+            // posed BY someone = authored. merge: only the bones sent, over an
+            // authored held pose (null releases one); otherwise the pose is
+            // theirs whole, and an empty one releases.
+            if (msg.pose) {
+              const next = msg.merge ? mergePose(this.heldPoseAuthored ? this.heldPose : null, msg.pose)
+                : (Object.keys(msg.pose).length ? msg.pose : null);
+              this.heldPose = next; this.heldPoseAuthored = next != null;
+            }
+            if (msg.anim) {
+              const anim = { ...msg.anim, replace: (msg.anim as { replace?: boolean }).replace !== false };
+              if (anim.replace) { this.heldPose = null; this.heldPoseAuthored = false; }
+              this.ws?.send(JSON.stringify({ type: "anim", ...anim }));
+            }
             this.onEvent?.({ ts: Date.now(), kind: "say", who: msg.by,
               text: `(posed you${msg.anim ? " with an animation" : ""})` } as any);
             break;
@@ -1798,7 +1817,8 @@ export class WorldAgent {
         // rounds a doorway instead of driving at the wall behind it.
         const next = this.legs.shift();
         if (next) {
-          this.target = { x: next.x, z: next.z, run: this.target.run, tolerance: this.target.tolerance };
+          this.target = { x: next.x, z: next.z, run: this.target.run,
+            tolerance: this.legs.length ? 0 : this.walkTolerance };
         } else {
           this.target = null; this.speed = 0; this.clip = "idle";
           this.walkDone?.(true); this.walkDone = null;
@@ -1808,8 +1828,14 @@ export class WorldAgent {
         this.speed = sp; this.clip = this.target.run ? "run" : "walk";
         this.yaw = Math.atan2(dx, dz);
         const step = Math.min(dist, sp * dt);
-        this.pos.x += (dx / dist) * step;
-        this.pos.z += (dz / dist) * step;
+        if (step === dist) {
+          // Land on the validated point exactly, rather than allowing a
+          // tolerance or floating residual to cut the next corner.
+          this.pos.x = this.target.x; this.pos.z = this.target.z;
+        } else {
+          this.pos.x += (dx / dist) * step;
+          this.pos.z += (dz / dist) * step;
+        }
       }
     }
     // a tumbling, lying, dragged, nailed or FLYING body owns its own y — the
@@ -1935,7 +1961,7 @@ export class WorldAgent {
 
   /** Resume MY OWN sim from wherever a drag left this body — the same
    *  settle-under-owner-authority browsers do, pins enforced for real. */
-  private async settleFromDrag(pose: Record<string, number[]> | null, sim?: any) {
+  private async settleFromDrag(pose: Record<string, PoseValue> | null, sim?: any) {
     const epoch = ++this.bodyEpoch;
     const body = await this.ensureBody();
     if (this.bodyEpoch !== epoch) return;
@@ -2423,7 +2449,7 @@ export class WorldAgent {
   /** Hand the body back to ordinary locomotion. */
   flightEnd() {
     this.flight = null;
-    this.pos.y = this.heightAt(this.pos.x, this.pos.z);
+    this.pos.y = this.groundAt(this.pos.x, this.pos.z);
     this.speed = 0; this.clip = "idle";
   }
 
@@ -2495,6 +2521,8 @@ export class WorldAgent {
   walkTo(x: number, z: number, run = false, timeoutMs = 90_000, tolerance = ARRIVE): Promise<boolean> {
     if (![x, z, tolerance].every(Number.isFinite) || tolerance < 0 || tolerance > 0.4) return Promise.resolve(false);
     this.walkDone?.(false); // cancel a previous walk
+    this.walkDone = null; this.target = null; this.legs = []; this.speed = 0;
+    this.walkRefusal = null; this.walkTolerance = tolerance;
     if (this.draggedBy) {   // deciding to walk IS breaking the dragger's hold
       this.ws?.send(JSON.stringify({ type: "bodydrag", target: this.draggedBy, end: true }));
       this.draggedBy = null;
@@ -2520,19 +2548,14 @@ export class WorldAgent {
     // and deciding to walk IS getting off the seat — a folded mount otherwise
     // glues this body to its socket on every renderer, wherever the feet go
     if (this.joined && this.mounts.has(this.name)) this.verb("dismount", { id: this.name });
-    // and stand on the ground you got up onto — which is the storey under
-    // your feet if you are upstairs in a building, not the terrain beneath
-    // the building (ew#140: a terrain-only clamp here grounded every body
-    // before the storey was resolved, so an upstairs walk routed against
-    // the downstairs walls)
+    // and stand on the ground you got up onto
     this.pos.y = this.groundAt(this.pos.x, this.pos.z);
-    // ROUTE THROUGH WALLS RATHER THAN INTO THEM. Straight-line walking samples
-    // only the height field, so a body crosses walls as if they were not there.
-    // Inside a griddled building the grid IS the navigation graph, so ask it.
-    // Failure is silent and total on purpose: no route (target outdoors, no
-    // structure, a sealed room) falls back to the old straight line, which is
-    // exactly the behaviour everywhere that has no building.
-    this.legs = [];
+    // Each local planner may offer a route around/through its building.
+    // Validate the offered polyline against EVERY known structure before
+    // accepting one. This is local planning, not global multi-building search.
+    const constraints: { id: string; plan: ReturnType<typeof planStructure>; e: Entity; y: number }[] = [];
+    const candidates: { points: Vec2[]; length: number; id: string }[] = [];
+    const refusals: string[] = [];
     for (const e of this.entities.values()) {
       const data = (e.comp ?? {}).structure;
       if (!data) continue;
@@ -2540,23 +2563,50 @@ export class WorldAgent {
         const plan = this.planOf(data);
         const [ax, ay, az] = localizePoint(e, this.pos.x, this.pos.y, this.pos.z);
         const [bx, , bz] = localizePoint(e, x, this.pos.y, z);
-        // route on the storey this body stands on, not the ground floor's plan
-        const pts = routeLocal(plan, ax, az, bx, bz, ay);
-        if (!pts || pts.length < 3) continue;    // straight line is already fine
+        constraints.push({ id: e.id, plan, e, y: ay });
+        const result = planRouteLocal(plan, ax, az, bx, bz, ay);
+        if (result.kind === "blocked") {
+          refusals.push("[" + e.id + "]: " + result.reason); continue;
+        }
+        if (result.kind === "clear") continue;
         const yaw = Number.isFinite(e.yaw) ? e.yaw : 0;
         const sc = Number.isFinite(e.scale) && e.scale > 0 ? e.scale : 1;
         const [px, , pz] = Array.isArray(e.pos) ? e.pos : [0, 0, 0];
         const c = Math.cos(yaw), n = Math.sin(yaw);
-        // grid-local back to world: the inverse of localizePoint
-        this.legs = pts.slice(1).map(([lx, lz]) => ({
+        const points = result.points.map(([lx, lz]) => ({
           x: px + (lx * c + lz * n) * sc,
           z: pz + (-lx * n + lz * c) * sc,
         }));
-        break;
-      } catch { /* one malformed house must not cost the route through a sound one — the fold is per building, like groundAt's */ }
+        const length = points.slice(1).reduce((sum, p, i) => sum + Math.hypot(p.x - points[i].x, p.z - points[i].z), 0);
+        candidates.push({ points, length, id: e.id });
+      } catch {
+        // A malformed component has no sound route to offer. Normalize handles
+        // primitive data as empty; keep inspecting other, well-formed houses.
+        refusals.push("[" + e.id + "]: structure could not be planned");
+      }
     }
+    candidates.sort((a, b) => a.length - b.length || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    let selected: Vec2[] | null = null;
+    for (const candidate of candidates) {
+      const valid = constraints.every(({ plan, e, y }) => candidate.points.slice(1).every((p, i) => {
+        const a = candidate.points[i];
+        const [ax, , az] = localizePoint(e, a.x, this.pos.y, a.z);
+        const [bx, , bz] = localizePoint(e, p.x, this.pos.y, p.z);
+        return routeSegmentClear(plan, ax, az, bx, bz, y);
+      }));
+      if (valid) { selected = candidate.points; break; }
+    }
+    if (!selected && (candidates.length || refusals.length)) {
+      this.walkRefusal = candidates.length
+        ? "no local route is clear of all structures (multi-building route search is unavailable)"
+        : "no route: " + refusals.join("; ");
+      this.clip = "idle";
+      return Promise.resolve(false);
+    }
+    this.legs = selected ? selected.slice(1) : [];
     const first = this.legs.shift();
-    this.target = first ? { x: first.x, z: first.z, run, tolerance } : { x, z, run, tolerance };
+    this.target = first ? { x: first.x, z: first.z, run, tolerance: this.legs.length ? 0 : tolerance }
+      : { x, z, run, tolerance };
     return new Promise((resolve) => {
       this.walkDone = resolve;
       setTimeout(() => { if (this.walkDone === resolve) { this.target = null; this.walkDone = null; resolve(false); } }, timeoutMs);
@@ -2674,7 +2724,7 @@ export class WorldAgent {
   }
 
   /** Hold a custom pose (yourself). Sparse bone -> [x,y,z,w] quaternion. */
-  setPose(bones: Record<string, number[]> | null, sticky = false) {
+  setPose(bones: Record<string, PoseValue> | null, sticky = false) {
     this.heldPose = bones;
     this.heldPoseAuthored = bones != null;
     // Only a deliberate self-pose can ask to survive walking, and only THIS
@@ -2685,7 +2735,7 @@ export class WorldAgent {
     if (bones == null && this.clip === "ragdoll") {
       this.body?.stop(); this.stopSim();
       this.clip = "idle";
-      this.pos.y = this.heightAt(this.pos.x, this.pos.z);
+      this.pos.y = this.groundAt(this.pos.x, this.pos.z);
     }
   }
 
@@ -2915,7 +2965,7 @@ export class WorldAgent {
     if (this.clip === "ragdoll" || (this.heldPose && !this.heldPoseAuthored)) {
       this.body?.stop(); this.stopSim();
       this.heldPose = null; this.heldPoseAuthored = false;
-      this.pos.y = this.heightAt(this.pos.x, this.pos.z);
+      this.pos.y = this.groundAt(this.pos.x, this.pos.z);
     }
     // and standing up IS getting off the seat
     if (clip === "idle" && this.joined && this.mounts.has(this.name)) this.verb("dismount", { id: this.name });
@@ -2935,20 +2985,23 @@ export class WorldAgent {
     }
   }
 
-  /** Play a one-off animation on yourself — relayed once, never logged. */
-  animate(data: { dur: number; loop?: boolean; tracks: Record<string, { t: number; q: number[] }[]> }) {
+  /** Play a one-off animation on yourself — relayed once, never logged.
+   *  Over your held pose and other animations; `replace` ends them first. */
+  animate(data: { dur: number; loop?: boolean; replace?: boolean; tracks: Record<string, { t: number; q: number[] }[]> }) {
+    if (data.replace) this.setPose(null);
     if (this.joined && this.ws?.readyState === 1) {
-      this.ws.send(JSON.stringify({ type: "anim", dur: data.dur, loop: !!data.loop, tracks: data.tracks }));
+      this.ws.send(JSON.stringify({ type: "anim", dur: data.dur, loop: !!data.loop, tracks: data.tracks,
+        replace: data.replace === true }));
     }
   }
 
   /** Ask another body to hold a pose or play an animation. It decides.
    *  `ragdoll: true` asks it to go limp; `{lean:[x,y,z]}` (m/s) says which
    *  way the shove sends it — the receiver simulates and caps for itself. */
-  puppet(target: string, spec: { pose?: Record<string, number[]>; anim?: unknown; ragdoll?: boolean | { lean: number[] } }) {
+  puppet(target: string, spec: { pose?: Record<string, PoseValue | null>; merge?: boolean; anim?: unknown; ragdoll?: boolean | { lean: number[] } }) {
     if (this.joined && this.ws?.readyState === 1) {
       this.ws.send(JSON.stringify({ type: "puppet", target,
-        pose: spec.pose ?? null, anim: spec.anim ?? null, ragdoll: spec.ragdoll ?? null }));
+        pose: spec.pose ?? null, ...(spec.merge ? { merge: true } : {}), anim: spec.anim ?? null, ragdoll: spec.ragdoll ?? null }));
     }
   }
 

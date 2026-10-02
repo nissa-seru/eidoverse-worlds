@@ -1,3 +1,4 @@
+import { routeLevel, clearLevelSegment } from './structure-route.js';
 // structure_field — the griddled-building model's pure half (§11.4 discipline,
 // sibling of models_field.js / flora_field.js / emitter_field.js).
 //
@@ -621,13 +622,7 @@ export function planStructure(data) {
     // mitred diagonal — this approximation is only what the body feels.
     for (const [k, e] of level.walls) {
       if (e.axis < 2) continue;
-      const a = [e.x * g.tile, e.z * g.tile];
-      const b = e.axis === 2
-        ? [(e.x + 1) * g.tile, (e.z + 1) * g.tile]
-        : [(e.x + 1) * g.tile, e.z * g.tile];
-      const a2 = e.axis === 2 ? a : [e.x * g.tile, (e.z + 1) * g.tile];
-      const [sx, sz] = e.axis === 2 ? a : b;
-      const [ex, ez] = e.axis === 2 ? b : a2;
+      const [[sx, sz], [ex, ez]] = segmentEnds(e, g);
       const open = ['door', 'arch'].includes(level.apertures.get(k));
       const N = 8, r = g.wallT * 0.8;
       for (let i = 0; i <= N; i++) {
@@ -1083,36 +1078,32 @@ export function routeCells(level, fromKey, toKey) {
   return null;
 }
 
-/** A route in grid-local metres: the true start, the centre of each cell the
- *  path turns in, and the true destination.
- *
- *  Only TURNS become waypoints. A straight run down a corridor is one leg, so a
- *  body walks it as a straight line instead of stuttering cell to cell — and
- *  the waypoint count stays proportional to the number of decisions rather than
- *  to the distance. */
+/** Select the same routing storey for planning and segment validation.
+ * Storey/standing-height resolution is the separate #140 contract. */
+function routingLevel(plan, fromX, fromZ, y) {
+  return levelAt(plan, fromX, fromZ, y)?.level ?? storeyAt(plan, y);
+}
+
+/** Rich route result: clear, routed, or blocked with a reason. Outdoor cells
+ * are navigable on this horizontal plane; the room graph stays floor-only. */
+export function planRouteLocal(plan, fromX, fromZ, toX, toZ, y = 0) {
+  if (![fromX, fromZ, toX, toZ].every(Number.isFinite)) return { kind: 'blocked', reason: 'non-finite endpoint', points: [] };
+  const lv = routingLevel(plan, fromX, fromZ, y);
+  if (!lv) return { kind: 'clear', points: [[fromX, fromZ], [toX, toZ]] };
+  return routeLevel(lv.level, plan.grid, [fromX, fromZ], [toX, toZ], lv.y === Math.min(...plan.levels.map(l => l.y)));
+}
+
+/** A cheap check of an actual route leg against this structure's walls. */
+export function routeSegmentClear(plan, fromX, fromZ, toX, toZ, y = 0) {
+  const lv = routingLevel(plan, fromX, fromZ, y);
+  return !lv || clearLevelSegment(lv.level, plan.grid, [fromX, fromZ], [toX, toZ]);
+}
+
+/** Compatibility surface for readers that need points rather than refusal
+ * details. A null route is blocked, never a validated straight line. */
 export function routeLocal(plan, fromX, fromZ, toX, toZ, y = 0) {
-  const g = plan.grid;
-  // The storey the body stands on, by height — the same rule the describer
-  // uses. Before this, the level was the first one with rooms (always the
-  // ground floor) and `y` was discarded, so an agent upstairs was routed
-  // against the downstairs walls and walked through the upstairs ones (ew#140).
-  const lv = levelAt(plan, fromX, fromZ, y)?.level ?? storeyAt(plan, y);
-  if (!lv) return null;
-  const level = lv.level;
-  const cells = routeCells(level, nodeAtPoint(level, g, fromX, fromZ), nodeAtPoint(level, g, toX, toZ));
-  if (!cells) return null;
-  const centre = (k) => {
-    const [x, z] = k.split(':')[0].split(',').map(Number);
-    return [(x + 0.5) * g.tile, (z + 0.5) * g.tile];
-  };
-  const pts = [[fromX, fromZ]];
-  for (let i = 1; i < cells.length - 1; i++) {
-    const [ax, az] = cells[i - 1].split(':')[0].split(',').map(Number);
-    const [bx, bz] = cells[i + 1].split(':')[0].split(',').map(Number);
-    if (ax !== bx && az !== bz) pts.push(centre(cells[i]));   // a turn
-  }
-  pts.push([toX, toZ]);
-  return pts;
+  const result = planRouteLocal(plan, fromX, fromZ, toX, toZ, y);
+  return result.kind === 'blocked' ? null : result.points;
 }
 
 // ---- swept wall geometry ----------------------------------------------------
@@ -1204,11 +1195,8 @@ export function wallPolylines(level, g) {
   const segs = [];
   for (const [k, e] of level.walls) {
     if (level.apertures.has(k)) continue;
-    const a = cellKey(e.x, e.z);
-    const b = e.axis === 0 ? cellKey(e.x + 1, e.z)
-      : e.axis === 1 ? cellKey(e.x, e.z + 1)
-      : e.axis === 2 ? cellKey(e.x + 1, e.z + 1)     // ↘ diagonal
-      : cellKey(e.x - 1, e.z + 1);                   // ↗ diagonal
+    const [start, end] = segmentEnds(e, { tile: 1 }); // vertex keys, before metre scaling
+    const a = cellKey(...start), b = cellKey(...end);
     segs.push({ a, b, mat: e.mat, used: false });
   }
   const inc = new Map();
@@ -1361,11 +1349,13 @@ export function sweepProfile(path, profile, y0, ends = null) {
 
 /** A wall segment's two endpoints in grid-local metres, for any axis. */
 export function segmentEnds(e, g) {
-  const a = [e.x * g.tile, e.z * g.tile];
+  // Both diagonals cut their OWN cell, as nodeAtPoint/halfTriangle define.
+  // Axis 3 starts at NE and ends at SW; its start is not the NW corner.
+  const a = [(e.x + (e.axis === 3 ? 1 : 0)) * g.tile, e.z * g.tile];
   const b = e.axis === 0 ? [(e.x + 1) * g.tile, e.z * g.tile]
     : e.axis === 1 ? [e.x * g.tile, (e.z + 1) * g.tile]
     : e.axis === 2 ? [(e.x + 1) * g.tile, (e.z + 1) * g.tile]
-    : [(e.x - 1) * g.tile, (e.z + 1) * g.tile];
+    : [e.x * g.tile, (e.z + 1) * g.tile];
   return [a, b];
 }
 
@@ -1432,11 +1422,7 @@ export function levelSweeps(level, g, floorY) {
     const ap = level.apertures.get(k);
     if (!ap) continue;
     const prf = APERTURES[ap];
-    const a = [e.x * g.tile, e.z * g.tile];
-    const b = e.axis === 0 ? [(e.x + 1) * g.tile, e.z * g.tile]
-      : e.axis === 1 ? [e.x * g.tile, (e.z + 1) * g.tile]
-      : e.axis === 2 ? [(e.x + 1) * g.tile, (e.z + 1) * g.tile]
-      : [(e.x - 1) * g.tile, (e.z + 1) * g.tile];
+    const [a, b] = segmentEnds(e, g);
     const top = Math.min(prf.top, g.wallH);
     const nd = neighbourDirs(level, g, k, e);
     for (const [lo, hi] of [[0, prf.bottom], [top, g.wallH]]) {

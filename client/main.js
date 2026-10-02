@@ -42,8 +42,9 @@ import { snapshot } from './lib/net_snap.js';
 import { myReachBag } from './lib/reachnet.js';
 import {
   net, connect, initIdentity, loginUrl, wireNet, sendVerb, sendPose, sendWhisper, sendTyping,
-  setPoseOverride,
+  setPoseOverride, sendPuppet, sendAnim,
 } from './lib/net.js';
+import { mergePose } from '../shared/humanoid.js';
 import { updateBuild, toggleEditMode, isEditing } from './lib/build.js';
 import { initPalette } from './lib/palette.js';
 import { setRightsSink } from './lib/state.js';
@@ -81,10 +82,11 @@ import { protoStats, forgetBytes, loadingItems, bootBytes } from './lib/assets.j
 import { grassTiles } from './lib/terrain.js';
 import { grassDiag } from './lib/grassdiag.js';
 import { warmStats } from './lib/warmqueue.js';
+import { budgetStats } from './lib/framebudget.js';
 import { pending, P, onIdle, laneStats as schedLaneStats } from './lib/scheduler.js';
 import { laneStats as loadLaneStats } from './lib/loadwork.js';
 import { colliderCacheStats } from './lib/colliders.js';
-import { governPerformance, governorDebug, whenCalm } from './lib/governor.js';
+import { governPerformance, governorDebug, whenCalm, applyPendingPixelRatio } from './lib/governor.js';
 import { registerSystem, startFrame, frameDebug } from './lib/frame.js';
 import { perf } from './lib/perf.js';
 import { renderWorld, drawStats, setDrawBatching } from './lib/render.js';
@@ -553,6 +555,7 @@ registerSystem('send-pose', (dt, t, now) => sendPose(now));
 // XR: read hands → fill intent (updateMe already moved the body) → rig follows
 registerSystem('xr', (dt) => updateXR(dt));
 registerSystem('xrvignette', (dt) => tickXRVignette(dt));   // comfort tunnel, on the XR camera (Settings › VR)
+registerSystem('pixel-ratio', () => applyPendingPixelRatio());   // a resize clears the canvas: before the draw, never after
 registerSystem('render', renderWorld);
 registerSystem('xrmirror', () => tickXRMirror());           // desktop view while presenting (Settings › VR)
 // radial-menu actions: the ring speaks through the same flows the keyboard does
@@ -788,6 +791,27 @@ globalThis.whyIsItSilent = () => {
 const EW = globalThis.EW = {
   me: () => getMe(), remotes, entities, myState, THREE, net, scene, camera, renderer, bus,
   skyArgs, sendVerb, setPosable, get posable() { return posable(); },
+  // POSING from the console — the same verbs an agent's tools have. A value
+  // per bone is [x,y,z,w] or {q, t, s} (shared/humanoid.js poseChannels).
+  //   EW.pose({ leftUpperArm: [...] })          only these bones, over what you hold; null releases one
+  //   EW.pose({ ... }, { replace: true })       the WHOLE pose: every bone not named goes back to normal
+  //   EW.pose({ ... }, { target: 'mythos' })    ask someone else (their client decides)
+  //   EW.clearPose()  /  EW.clearPose('mythos')
+  //   EW.animate(anim, { replace, target })     one-off animation; merge plays over your pose and any
+  //                                             other animation, replace ends them first
+  pose: (bones, { replace = false, target = null } = {}) => {
+    if (target) return sendPuppet(target, { pose: bones, merge: !replace });
+    myState.pose = mergePose(replace ? null : myState.pose, bones);
+    return myState.pose;
+  },
+  clearPose: (target = null) => { if (target) sendPuppet(target, { pose: {} }); else myState.pose = null; },
+  animate: (data, { replace = data?.replace === true, target = null } = {}) => {   // replace may ride in the data too
+    const a = { ...data, replace: !!replace };
+    if (target) return sendPuppet(target, { anim: a });
+    if (replace) myState.pose = null;
+    getMe()?.playAnimation(a);
+    sendAnim(a);
+  },
   setPushable, get pushable() { return pushable(); }, dragState,
   // reach: aim a hand at a world point, or at anything that moves. Pass a
   // function and it re-solves every frame; `EW.reach('leftHand', () =>
@@ -943,6 +967,8 @@ const EW = globalThis.EW = {
   residency: residencyDebug,   // real/stand-in/loading counts + sweep stats (§13.3)
   gpu: () => ({ ...renderer.info.memory, ...protoStats() }),   // bytes + proto/byte tiers
   draws: drawStats,
+  foliage: () => import('./lib/foliage.js').then((m) => m.foliageDebug()),
+  overdraw: (opts) => import('./lib/overdraw.js').then((m) => m.overdrawCapture(opts)),   // fragments shaded per pixel, by category
   setDrawBatching,
   frame: frameDebug,           // per-system rolling ms + strides (§14.2 6b)
   grass: grassTiles,           // tile-level draw truth (§13.2, landed 8e)
@@ -950,6 +976,7 @@ const EW = globalThis.EW = {
   grassDiag,                   // §22: `await EW.grassDiag()` — the meadow's GPU cost, attributed by difference
   setCloudQuality,             // §22b: the sky pane's tier knob, console-reachable for diagnosis
   warm: warmStats,             // the conductor's queue (§16.2.A)
+  budget: budgetStats,         // the shared per-frame background budget: share, debt, per-lane spend/grants/denials
   lanes: () => ({ sched: schedLaneStats(), load: loadLaneStats() }),  // queue depths vs caps
   colliderCache: colliderCacheStats,   // per-lib shared BVH/lie bytes (§16.2.C)
 };
